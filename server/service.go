@@ -40,16 +40,16 @@ type httpErrorResp struct {
 type BoostServiceOpts struct {
 	Log                   *logrus.Entry
 	ListenAddr            string
-	Relays                []RelayEntry
 	GenesisForkVersionHex string
 	RelayRequestTimeout   time.Duration
 	RelayCheck            bool
+	PCS                   *ProposerConfigurationStorage
 }
 
 // BoostService - the mev-boost service
 type BoostService struct {
 	listenAddr string
-	relays     []RelayEntry
+	pcs        *ProposerConfigurationStorage
 	log        *logrus.Entry
 	srv        *http.Server
 	relayCheck bool
@@ -58,12 +58,12 @@ type BoostService struct {
 	httpClient           http.Client
 
 	bidsLock sync.Mutex
-	bids     map[bidRespKey]bidResp // keeping track of bids, to log the originating relay on withholding
+	bids     map[bidRespKey]*bidResp // keeping track of bids, to log the originating relay on withholding
 }
 
 // NewBoostService created a new BoostService
 func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
-	if len(opts.Relays) == 0 {
+	if len(opts.PCS.GetAllRelays()) == 0 {
 		return nil, errors.New("no relays")
 	}
 
@@ -74,10 +74,10 @@ func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 
 	return &BoostService{
 		listenAddr: opts.ListenAddr,
-		relays:     opts.Relays,
 		log:        opts.Log.WithField("module", "service"),
+		pcs:        opts.PCS,
 		relayCheck: opts.RelayCheck,
-		bids:       make(map[bidRespKey]bidResp),
+		bids:       make(map[bidRespKey]*bidResp),
 
 		builderSigningDomain: builderSigningDomain,
 		httpClient: http.Client{
@@ -181,7 +181,7 @@ func (m *BoostService) handleStatus(w http.ResponseWriter, req *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	for _, r := range m.relays {
+	for _, r := range m.pcs.GetAllRelays() {
 		wg.Add(1)
 
 		go func(relay RelayEntry) {
@@ -229,23 +229,27 @@ func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.
 		"ua":               ua,
 	})
 
-	relayRespCh := make(chan error, len(m.relays))
+	relayRespCh := make(chan error, len(m.pcs.GetAllRelays()))
 
-	for _, relay := range m.relays {
-		go func(relay RelayEntry) {
-			url := relay.GetURI(pathRegisterValidator)
-			log := log.WithField("url", url)
+	for _, registration := range payload {
+		proposerConfig := m.pcs.GetProposerConfiguration(registration.Message.Pubkey)
 
-			_, err := SendHTTPRequest(context.Background(), m.httpClient, http.MethodPost, url, ua, payload, nil)
-			relayRespCh <- err
-			if err != nil {
-				log.WithError(err).Warn("error calling registerValidator on relay")
-				return
-			}
-		}(relay)
+		for _, relay := range proposerConfig.Relays {
+			go func(relay RelayEntry) {
+				url := relay.GetURI(pathRegisterValidator)
+				log := log.WithField("url", url)
+
+				_, err := SendHTTPRequest(context.Background(), m.httpClient, http.MethodPost, url, ua, payload, nil)
+				relayRespCh <- err
+				if err != nil {
+					log.WithError(err).Warn("error calling registerValidator on relay")
+					return
+				}
+			}(relay)
+		}
 	}
 
-	for i := 0; i < len(m.relays); i++ {
+	for i := 0; i < len(m.pcs.GetAllRelays()); i++ {
 		respErr := <-relayRespCh
 		if respErr == nil {
 			m.respondOK(w, nilResponse)
@@ -259,32 +263,32 @@ func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.
 // handleGetHeader requests bids from the relays
 func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
-	slot := vars["slot"]
-	parentHashHex := vars["parent_hash"]
-	pubkey := vars["pubkey"]
-	log := m.log.WithFields(logrus.Fields{
-		"method":     "getHeader",
-		"slot":       slot,
-		"parentHash": parentHashHex,
-		"pubkey":     pubkey,
-	})
-	log.Debug("getHeader")
 
-	_slot, err := strconv.ParseUint(slot, 10, 64)
+	publicKey, err := types.HexToPubkey(vars["pubkey"])
+	if err != nil {
+		m.respondError(w, http.StatusBadRequest, errInvalidPubkey.Error())
+		return
+	}
+
+	slot, err := strconv.ParseUint(vars["slot"], 10, 64)
 	if err != nil {
 		m.respondError(w, http.StatusBadRequest, errInvalidSlot.Error())
 		return
 	}
 
-	if len(pubkey) != 98 {
-		m.respondError(w, http.StatusBadRequest, errInvalidPubkey.Error())
-		return
-	}
-
-	if len(parentHashHex) != 66 {
+	parentHash := types.Hash{}
+	if err := parentHash.UnmarshalText([]byte(vars["parent_hash"])); err != nil {
 		m.respondError(w, http.StatusBadRequest, errInvalidHash.Error())
 		return
 	}
+
+	log := m.log.WithFields(logrus.Fields{
+		"method":     "getHeader",
+		"slot":       slot,
+		"parentHash": parentHash.String(),
+		"pubkey":     publicKey.String(),
+	})
+	log.Debug("getHeader")
 
 	var mu sync.Mutex
 	relays := make(map[string][]string) // relays per blockHash
@@ -292,13 +296,16 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 
 	ua := UserAgent(req.Header.Get("User-Agent"))
 
+	// Select the relays we want mev-boost to reach.
+	proposerConfig := m.pcs.GetProposerConfiguration(publicKey)
+
 	// Call the relays
 	var wg sync.WaitGroup
-	for _, relay := range m.relays {
+	for _, relay := range proposerConfig.Relays {
 		wg.Add(1)
 		go func(relay RelayEntry) {
 			defer wg.Done()
-			path := fmt.Sprintf("/eth/v1/builder/header/%s/%s/%s", slot, parentHashHex, pubkey)
+			path := fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", slot, parentHash.String(), publicKey.String())
 			url := relay.GetURI(path)
 			log := log.WithField("url", url)
 			responsePayload := new(types.GetHeaderResponse)
@@ -344,9 +351,9 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 
 			// Verify response coherence with proposer's input data
 			responseParentHash := responsePayload.Data.Message.Header.ParentHash.String()
-			if responseParentHash != parentHashHex {
+			if responseParentHash != parentHash.String() {
 				log.WithFields(logrus.Fields{
-					"originalParentHash": parentHashHex,
+					"originalParentHash": parentHash.String(),
 					"responseParentHash": responseParentHash,
 				}).Error("proposer and relay parent hashes are not the same")
 				return
@@ -410,9 +417,10 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 	}).Info("best bid")
 
 	// Remember the bid, for future logging in case of withholding
-	bidKey := bidRespKey{slot: _slot, blockHash: result.blockHash}
+	bidKey := bidRespKey{slot: slot, blockHash: result.blockHash}
 	m.bidsLock.Lock()
-	m.bids[bidKey] = result
+	result.proposerPublicKey = publicKey
+	m.bids[bidKey] = &result
 	m.bidsLock.Unlock()
 
 	// Return the bid
@@ -444,7 +452,23 @@ func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request
 	requestCtx, requestCtxCancel := context.WithCancel(context.Background())
 	defer requestCtxCancel()
 
-	for _, relay := range m.relays {
+	key := bidRespKey{
+		slot:      payload.Message.Slot,
+		blockHash: payload.Message.Body.ExecutionPayloadHeader.BlockHash.String(),
+	}
+
+	// It means that someone is trying to call getPayload without having called getHeader first.
+	if m.bids[key] == nil {
+		// TODO: Log error.
+		// log.WithField("", "").Errorf("")
+		m.respondError(w, http.StatusBadGateway, errNoSuccessfulRelayResponse.Error())
+		return
+	}
+
+	publicKey := m.bids[key].proposerPublicKey
+	configurationStorage := m.pcs.GetProposerConfiguration(publicKey)
+
+	for _, relay := range configurationStorage.Relays {
 		wg.Add(1)
 		go func(relay RelayEntry) {
 			defer wg.Done()
@@ -507,7 +531,7 @@ func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request
 
 // CheckRelays sends a request to each one of the relays previously registered to get their status
 func (m *BoostService) CheckRelays() bool {
-	for _, relay := range m.relays {
+	for _, relay := range m.pcs.GetAllRelays() {
 		m.log.WithField("relay", relay.String()).Info("Checking relay")
 
 		url := relay.GetURI(pathStatus)
