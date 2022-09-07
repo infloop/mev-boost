@@ -1,5 +1,5 @@
 VERSION ?= $(shell git describe --tags --always --dirty="-dev")
-DOCKER_REPO := flashbots/mev-boost
+DOCKER_REPO := infloop/mev-boost
 
 .PHONY: all
 all: build
@@ -69,7 +69,6 @@ docker-image-portable:
 
 .PHONY: docker-push
 docker-push:
-	docker push ${DOCKER_REPO}:${VERSION}
 	docker push ${DOCKER_REPO}:latest
 
 .PHONY: clean
